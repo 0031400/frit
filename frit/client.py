@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import socket
 import threading
-import time
 
 from . import crypto
 from . import message as msg
@@ -89,44 +88,54 @@ class Client:
         self.cfg = cfg
         self.key = crypto.derive_key(cfg.psk)
         self._proxies = {p.name: p for p in cfg.proxies}
+        self._stop = threading.Event()
+        self._control: socket.socket | None = None
+
+    def shutdown(self) -> None:
+        """Request the run loop to stop and close the control connection."""
+        self._stop.set()
+        _safe_close(self._control)
+        self._control = None
 
     def run(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
                 self._run_session()
             except (OSError, crypto.CryptoError, protocol.ProtocolError) as exc:
                 log.warning("session ended: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 log.exception("session error: %s", exc)
+            if self._stop.is_set():
+                break
             log.info("reconnecting in %.0fs", RECONNECT_DELAY)
-            time.sleep(RECONNECT_DELAY)
+            # Interruptible sleep so shutdown()/Ctrl+C is honoured promptly.
+            if self._stop.wait(RECONNECT_DELAY):
+                break
+        log.info("client stopped")
 
     def _connect_server(self) -> socket.socket:
         sock = socket.create_connection((self.cfg.server_host, self.cfg.server_port), timeout=10)
-        sock.settimeout(None)
+        sock.settimeout(0.5)
         return sock
 
     def _run_session(self) -> None:
         control = self._connect_server()
+        self._control = control
         try:
             login = msg.LoginReq(name=self.cfg.name, proxies=self.cfg.proxies)
             _send_control(control, self.key, login.to_dict())
 
-            frame_type, payload = _recv_frame(control, self.key)
-            if frame_type != protocol.FRAME_TYPE_CTRL:
-                raise protocol.ProtocolError("login response not CTRL frame")
-            res = protocol.decode_control(payload)
+            res = self._recv_control_until(control)
             code = int(res.get("code", -1))
             if code != msg.CODE_OK:
                 raise OSError(f"login rejected, code={code}")
             name = res.get("name") or self.cfg.name
             log.info("login success, name=%s", name)
 
-            while True:
-                frame_type, payload = _recv_frame(control, self.key)
-                if frame_type != protocol.FRAME_TYPE_CTRL:
-                    raise protocol.ProtocolError("non-CTRL frame on control connection")
-                d = protocol.decode_control(payload)
+            while not self._stop.is_set():
+                d = self._recv_control_until(control)
+                if d is None:
+                    return
                 if d.get("type") == msg.CONNECT_REQ:
                     threading.Thread(
                         target=self._handle_connect_req,
@@ -137,6 +146,24 @@ class Client:
                     log.debug("unknown control message: %s", d.get("type"))
         finally:
             _safe_close(control)
+            if self._control is control:
+                self._control = None
+
+    def _recv_control_until(self, control: socket.socket) -> dict | None:
+        """Read one control frame, polling so a pending shutdown is honoured."""
+        while not self._stop.is_set():
+            try:
+                frame_type, payload = _recv_frame(control, self.key)
+            except socket.timeout:
+                continue
+            except (OSError, crypto.CryptoError):
+                if self._stop.is_set():
+                    return None
+                raise
+            if frame_type != protocol.FRAME_TYPE_CTRL:
+                raise protocol.ProtocolError("non-CTRL frame on control connection")
+            return protocol.decode_control(payload)
+        return None
 
     def _handle_connect_req(self, client_name: str, service_name: str, task_id: int) -> None:
         proxy = self._proxies.get(service_name)
@@ -149,6 +176,8 @@ class Client:
         except OSError as exc:
             log.error("connect data channel: %s", exc)
             return
+        # Data connections relay raw bytes; use blocking mode (no 0.5s timeout).
+        data.settimeout(None)
 
         try:
             res = msg.ConnectRes(code=msg.CODE_OK, task_id=task_id,

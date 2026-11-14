@@ -2,18 +2,25 @@
 
 The config file path comes from the command line only; no environment variables
 are read.
+
+Signals: SIGINT / SIGTERM / SIGBREAK are turned into an orderly shutdown so that
+Ctrl+C reliably stops the process (including on Windows, where `uv run` wraps the
+real interpreter in a launcher and the child sometimes misses the console event).
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 
 from . import __version__
 from .client import Client
 from .config import ClientConfig, ConfigError, ServerConfig
 from .server import Server
+
+log = logging.getLogger("frit.cli")
 
 
 def _setup_logging(debug: bool) -> None:
@@ -22,6 +29,26 @@ def _setup_logging(debug: bool) -> None:
         format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _install_signal_handlers(on_stop) -> None:
+    """Register handlers that call on_stop() and then raise SystemExit."""
+
+    def handler(signum, _frame):
+        log.info("received signal %s, shutting down", signum)
+        try:
+            on_stop()
+        finally:
+            raise SystemExit(0)
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                # Not in main thread or unsupported signal; ignore.
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,17 +68,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "server":
             cfg = ServerConfig.load(args.config)
             _setup_logging(cfg.debug)
-            Server(cfg).run()
+            server = Server(cfg)
+            _install_signal_handlers(server.shutdown)
+            server.run()
         else:
             cfg = ClientConfig.load(args.config)
             _setup_logging(cfg.debug)
-            Client(cfg).run()
+            client = Client(cfg)
+            _install_signal_handlers(client.shutdown)
+            client.run()
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("bye", file=sys.stderr)
         return 0
+    except SystemExit as exc:
+        return int(exc.code or 0)
     return 0
 
 

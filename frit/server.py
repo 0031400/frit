@@ -168,13 +168,43 @@ class Server:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.cfg.host, self.cfg.port))
         srv.listen(128)
+        # A short accept timeout lets the loop observe self._stop promptly, so a
+        # signal handler (see cli.py) can shut the server down cleanly even while
+        # accept() is waiting.
+        srv.settimeout(0.5)
+        self._stop = threading.Event()
         log.info("listen on tcp://%s:%d", self.cfg.host, self.cfg.port)
         try:
-            while True:
-                conn, addr = srv.accept()
+            while not self._stop.is_set():
+                try:
+                    conn, addr = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                    raise
                 threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
+        except KeyboardInterrupt:
+            log.info("interrupted, shutting down")
         finally:
-            srv.close()
+            self._stop.set()
+            try:
+                srv.close()
+            except OSError:
+                pass
+            for client in self._all_clients():
+                client.close_all()
+
+    def shutdown(self) -> None:
+        """Ask the accept loop to stop and tear down all client connections."""
+        stop = getattr(self, "_stop", None)
+        if stop is not None:
+            stop.set()
+
+    def _all_clients(self) -> list["_Client"]:
+        with self._lock:
+            return list(self._clients.values())
 
     # -- first-frame dispatch (the auth middleware) ------------------------
     def _handle(self, conn: socket.socket, addr) -> None:
