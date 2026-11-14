@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import sys
 import threading
 
 from . import crypto
@@ -37,6 +38,37 @@ class BindError(Exception):
         self.port = port
         self.cause = cause
         super().__init__(f"cannot bind tcp://{host}:{port}: {cause}")
+
+
+# --------------------------------------------------------------------------
+# listener creation (cross-platform port semantics)
+# --------------------------------------------------------------------------
+def _make_listener(host: str, port: int, backlog: int = 128) -> socket.socket:
+    """Create a TCP listening socket with correct, platform-aware semantics.
+
+    - Windows: use SO_EXCLUSIVEADDRUSE so the port is truly exclusive.  If
+      another process (regardless of its own SO_REUSEADDR) is listening on the
+      port, bind() fails -- matching the intuition "port in use should be
+      reported".  The tradeoff is that an immediate restart may briefly fail
+      while the port is still in TIME_WAIT.
+    - POSIX (Linux/macOS): use SO_REUSEADDR so the socket may be rebound while
+      old connections sit in TIME_WAIT (fast restart), while bind() still fails
+      against an actively listening socket.
+
+    Raises OSError if the address cannot be bound.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(backlog)
+    except OSError:
+        sock.close()
+        raise
+    return sock
 
 
 # --------------------------------------------------------------------------
@@ -174,18 +206,14 @@ class Server:
         self._clients: dict[str, _Client] = {}
 
     def run(self) -> None:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            srv.bind((self.cfg.host, self.cfg.port))
+            srv = _make_listener(self.cfg.host, self.cfg.port)
         except OSError as exc:
             log.error(
                 "cannot bind tcp://%s:%d (%s). The port may already be in use.",
                 self.cfg.host, self.cfg.port, exc,
             )
-            srv.close()
             raise BindError(self.cfg.host, self.cfg.port, exc) from exc
-        srv.listen(128)
         # A short accept timeout lets the loop observe self._stop promptly, so a
         # signal handler (see cli.py) can shut the server down cleanly even while
         # accept() is waiting.
@@ -293,10 +321,7 @@ class Server:
         self._read_control(conn, req.name)
 
     def _open_service(self, client_name: str, proxy) -> _Service:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((proxy.remote_ip, proxy.remote_port))
-        s.listen(128)
+        s = _make_listener(proxy.remote_ip, proxy.remote_port)
         log.info("service %s/%s listening on %s:%d",
                  client_name, proxy.name, proxy.remote_ip, proxy.remote_port)
         return _Service(proxy.name, s, self.key)
