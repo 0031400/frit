@@ -1,0 +1,15 @@
+{
+    "server": "tcp://your-server-host:40000",
+    "psk": "change-me-to-a-strong-shared-secret",
+    "name": "desktop",
+    "debug": false,
+    "proxies": [
+        {
+            "name": "http1",
+            "localIP": "127.0.0.1",
+            "localPort": 8000,
+            "remoteIP": "0.0.0.0",
+            "remotePort": 8000
+        }
+    ]
+}

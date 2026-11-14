@@ -1,0 +1,5 @@
+{
+    "listen": "tcp://0.0.0.0:40000",
+    "psk": "change-me-to-a-strong-shared-secret",
+    "debug": false
+}
