@@ -60,14 +60,6 @@ uv run frit client -c data/client.json
 
 `-c` 省略时默认读取当前目录的 `config.json`。
 
-## 自测
-
-```bash
-uv run python selftest.py
-```
-
-启动本地 echo 服务 + frit server + frit client，验证小/大报文往返、以及错误 PSK 客户端被拒绝。
-
 ## 加密说明
 
 - key = `SHA256(psk)[:16]`（AES-128）。
