@@ -1,16 +1,17 @@
 """Command line entry point: `frit server -c cfg.json` / `frit client -c cfg.json`.
 
 The config file path comes from the command line only; no environment variables
-are read.
+are read.  Runs on a single asyncio event loop.
 
-Signals: SIGINT / SIGTERM / SIGBREAK are turned into an orderly shutdown so that
-Ctrl+C reliably stops the process (including on Windows, where `uv run` wraps the
-real interpreter in a launcher and the child sometimes misses the console event).
+Signals: SIGINT / SIGTERM / SIGBREAK trigger an orderly shutdown.  Ctrl+C works
+even on Windows under `uv run`, where the launcher may swallow the console event
+for the child, because the interpreter itself registers the handler.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import signal
 import sys
@@ -31,24 +32,50 @@ def _setup_logging(debug: bool) -> None:
     )
 
 
-def _install_signal_handlers(on_stop) -> None:
-    """Register handlers that call on_stop() and then raise SystemExit."""
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, on_stop) -> None:
+    """Make SIGINT/SIGTERM/SIGBREAK cancel the main task for a clean shutdown."""
 
-    def handler(signum, _frame):
-        log.info("received signal %s, shutting down", signum)
+    def stop() -> None:
+        log.info("shutdown requested")
         try:
             on_stop()
-        finally:
-            raise SystemExit(0)
+        except Exception:  # noqa: BLE001
+            pass
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
 
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         sig = getattr(signal, name, None)
-        if sig is not None:
-            try:
-                signal.signal(sig, handler)
-            except (ValueError, OSError):
-                # Not in main thread or unsupported signal; ignore.
-                pass
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stop)
+            continue
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            pass
+        # Windows: add_signal_handler is not implemented for most signals.
+        try:
+            signal.signal(sig, lambda _s, _f: loop.call_soon_threadsafe(stop))
+        except (ValueError, OSError):
+            pass
+
+
+async def _amain(mode: str, config_path: str) -> int:
+    loop = asyncio.get_running_loop()
+
+    if mode == "server":
+        cfg = ServerConfig.load(config_path)
+        _setup_logging(cfg.debug)
+        server = Server(cfg)
+        _install_signal_handlers(loop, server.shutdown)
+        await server.run()
+    else:
+        cfg = ClientConfig.load(config_path)
+        _setup_logging(cfg.debug)
+        client = Client(cfg)
+        _install_signal_handlers(loop, client.shutdown)
+        await client.run()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,18 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.mode == "server":
-            cfg = ServerConfig.load(args.config)
-            _setup_logging(cfg.debug)
-            server = Server(cfg)
-            _install_signal_handlers(server.shutdown)
-            server.run()
-        else:
-            cfg = ClientConfig.load(args.config)
-            _setup_logging(cfg.debug)
-            client = Client(cfg)
-            _install_signal_handlers(client.shutdown)
-            client.run()
+        return asyncio.run(_amain(args.mode, args.config))
+    except asyncio.CancelledError:
+        return 0
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -88,7 +106,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except SystemExit as exc:
         return int(exc.code or 0)
-    return 0
 
 
 if __name__ == "__main__":

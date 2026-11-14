@@ -1,9 +1,9 @@
-"""Threaded server: control connection + dynamic per-proxy listeners + relay.
+"""Asyncio server: control connection + dynamic per-proxy listeners + relay.
 
 Flow (mirrors the Go reference, minus the L4 handshake):
 
   client connects -> first (encrypted) frame must be a CTRL frame with
-                     loginReq{name, proxies}; otherwise the connection is dropped
+                     loginReq{name, proxies}; otherwise it is dropped
                      (this is the "authentication middleware")
   server replies loginRes over the control connection
   server opens a real TCP listener on each proxy's remoteIP:remotePort
@@ -12,16 +12,18 @@ Flow (mirrors the Go reference, minus the L4 handshake):
   server pairs by (client_name, service_name, taskId) and relays bytes
 
 All bytes on every connection travel inside the encrypted, typed frame format
-defined in protocol.py / crypto.py.
+defined in protocol.py / crypto.py.  The whole thing is a single-event-loop
+asyncio program (no threads).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import socket
 import sys
-import threading
 
+from . import aio
 from . import crypto
 from . import message as msg
 from . import protocol
@@ -43,19 +45,17 @@ class BindError(Exception):
 # --------------------------------------------------------------------------
 # listener creation (cross-platform port semantics)
 # --------------------------------------------------------------------------
-def _make_listener(host: str, port: int, backlog: int = 128) -> socket.socket:
-    """Create a TCP listening socket with correct, platform-aware semantics.
+def make_listen_socket(host: str, port: int, backlog: int = 128) -> socket.socket:
+    """Create a TCP listening socket with platform-aware port semantics.
 
-    - Windows: use SO_EXCLUSIVEADDRUSE so the port is truly exclusive.  If
-      another process (regardless of its own SO_REUSEADDR) is listening on the
-      port, bind() fails -- matching the intuition "port in use should be
-      reported".  The tradeoff is that an immediate restart may briefly fail
-      while the port is still in TIME_WAIT.
-    - POSIX (Linux/macOS): use SO_REUSEADDR so the socket may be rebound while
-      old connections sit in TIME_WAIT (fast restart), while bind() still fails
-      against an actively listening socket.
+    - Windows: SO_EXCLUSIVEADDRUSE so the port is exclusive; bind() fails if
+      another process is listening on the same address:port.  (Restarting may
+      briefly fail while the port is still in TIME_WAIT.)
+    - POSIX: SO_REUSEADDR so a port in TIME_WAIT can be rebound (fast restart),
+      while bind() still fails against an actively listening socket.
 
-    Raises OSError if the address cannot be bound.
+    The socket is returned already bound+listening, and can be handed to
+    loop.create_server(sock=...).
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -65,134 +65,74 @@ def _make_listener(host: str, port: int, backlog: int = 128) -> socket.socket:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         sock.listen(backlog)
+        sock.setblocking(False)
     except OSError:
         sock.close()
         raise
     return sock
 
 
-# --------------------------------------------------------------------------
-# frame helpers
-# --------------------------------------------------------------------------
-def _safe_close(sock: socket.socket | None) -> None:
-    if sock is None:
+def _close_writer(writer: asyncio.StreamWriter | None) -> None:
+    if writer is None:
         return
     try:
-        sock.close()
-    except OSError:
+        writer.close()
+    except Exception:  # noqa: BLE001
         pass
-
-
-def _recv_frame(sock: socket.socket, key: bytes) -> tuple[int, bytes]:
-    return protocol.decode_frame(crypto.read_frame(sock.makefile("rb", buffering=0), key))
-
-
-def _send_control(sock: socket.socket, key: bytes, obj: dict, lock: threading.Lock) -> None:
-    payload = protocol.encode_control(obj)
-    with lock:
-        crypto.write_frame(sock.makefile("wb", buffering=0), key, payload)
-
-
-def _relay_encrypted(plain: socket.socket, data: socket.socket, key: bytes) -> None:
-    """Bridge a plaintext peer (`plain`) and an encrypted data connection (`data`)."""
-    done = threading.Event()
-
-    def plain_to_data() -> None:
-        try:
-            w = data.makefile("wb", buffering=0)
-            while True:
-                buff = plain.recv(65536)
-                if not buff:
-                    break
-                crypto.write_frame(w, key, protocol.encode_frame(protocol.FRAME_TYPE_DATA, buff))
-        except (OSError, crypto.CryptoError, protocol.ProtocolError):
-            pass
-        finally:
-            done.set()
-
-    def data_to_plain() -> None:
-        try:
-            r = data.makefile("rb", buffering=0)
-            while True:
-                frame_type, payload = protocol.decode_frame(crypto.read_frame(r, key))
-                if frame_type != protocol.FRAME_TYPE_DATA:
-                    break  # only data frames are valid on a data connection
-                if not payload:
-                    break
-                plain.sendall(payload)
-        except (OSError, crypto.CryptoError, protocol.ProtocolError):
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=plain_to_data, daemon=True).start()
-    threading.Thread(target=data_to_plain, daemon=True).start()
-    done.wait()
-    _safe_close(plain)
-    _safe_close(data)
 
 
 # --------------------------------------------------------------------------
 # model
 # --------------------------------------------------------------------------
 class _Service:
-    def __init__(self, name: str, sock: socket.socket, key: bytes):
+    def __init__(self, name: str, server: asyncio.AbstractServer | None):
         self.name = name
-        self.sock = sock
-        self.key = key
-        self._lock = threading.Lock()
+        self.server = server
         self._task_id = 0
-        self._sessions: dict[int, socket.socket] = {}
+        # task_id -> (external reader, external writer)  [plaintext peer]
+        self._sessions: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
 
     def next_task_id(self) -> int:
-        with self._lock:
-            self._task_id += 1
-            return self._task_id
+        self._task_id += 1
+        return self._task_id
 
-    def add_session(self, task_id: int, conn: socket.socket) -> None:
-        with self._lock:
-            self._sessions[task_id] = conn
+    def add_session(
+        self,
+        task_id: int,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._sessions[task_id] = (reader, writer)
 
-    def pop_session(self, task_id: int) -> socket.socket | None:
-        with self._lock:
-            return self._sessions.pop(task_id, None)
+    def pop_session(
+        self, task_id: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        return self._sessions.pop(task_id, None)
 
-    def close_all(self) -> None:
-        _safe_close(self.sock)
-        with self._lock:
-            for conn in self._sessions.values():
-                _safe_close(conn)
-            self._sessions.clear()
+    def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
+        for _reader, writer in self._sessions.values():
+            _close_writer(writer)
+        self._sessions.clear()
 
 
 class _Client:
-    def __init__(self, name: str, control: socket.socket, key: bytes):
+    def __init__(self, name: str, control: asyncio.StreamWriter, key: bytes):
         self.name = name
         self.control = control
         self.key = key
-        self._lock = threading.RLock()
-        self._services: dict[str, _Service] = {}
-        self._write_lock = threading.Lock()
+        self.services: dict[str, _Service] = {}
+        self._write_lock = asyncio.Lock()
 
-    def add_service(self, service: _Service) -> None:
-        with self._lock:
-            self._services[service.name] = service
+    async def send(self, obj: dict) -> None:
+        async with self._write_lock:
+            await aio.send_control(self.control, self.key, obj)
 
-    def get_service(self, name: str) -> _Service | None:
-        with self._lock:
-            return self._services.get(name)
-
-    def all_services(self) -> list[_Service]:
-        with self._lock:
-            return list(self._services.values())
-
-    def send(self, obj: dict) -> None:
-        _send_control(self.control, self.key, obj, self._write_lock)
-
-    def close_all(self) -> None:
-        for svc in self.all_services():
-            svc.close_all()
-        _safe_close(self.control)
+    def close(self) -> None:
+        for svc in self.services.values():
+            svc.close()
+        _close_writer(self.control)
 
 
 # --------------------------------------------------------------------------
@@ -202,214 +142,211 @@ class Server:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
         self.key = crypto.derive_key(cfg.psk)
-        self._lock = threading.RLock()
-        self._clients: dict[str, _Client] = {}
+        self.clients: dict[str, _Client] = {}
+        self._main_server: asyncio.AbstractServer | None = None
+        self._stop = False
 
-    def run(self) -> None:
+    async def run(self) -> None:
         try:
-            srv = _make_listener(self.cfg.host, self.cfg.port)
+            sock = make_listen_socket(self.cfg.host, self.cfg.port)
         except OSError as exc:
             log.error(
                 "cannot bind tcp://%s:%d (%s). The port may already be in use.",
                 self.cfg.host, self.cfg.port, exc,
             )
             raise BindError(self.cfg.host, self.cfg.port, exc) from exc
-        # A short accept timeout lets the loop observe self._stop promptly, so a
-        # signal handler (see cli.py) can shut the server down cleanly even while
-        # accept() is waiting.
-        srv.settimeout(0.5)
-        self._stop = threading.Event()
+
+        self._main_server = await asyncio.start_server(
+            self._handle, sock=sock
+        )
         log.info("listen on tcp://%s:%d", self.cfg.host, self.cfg.port)
         try:
-            while not self._stop.is_set():
-                try:
-                    conn, addr = srv.accept()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    if self._stop.is_set():
-                        break
-                    raise
-                threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
-        except KeyboardInterrupt:
-            log.info("interrupted, shutting down")
+            async with self._main_server:
+                await self._main_server.serve_forever()
+        except asyncio.CancelledError:
+            pass
         finally:
-            self._stop.set()
-            try:
-                srv.close()
-            except OSError:
-                pass
-            for client in self._all_clients():
-                client.close_all()
+            self._stop = True
+            for client in list(self.clients.values()):
+                client.close()
+            self.clients.clear()
 
     def shutdown(self) -> None:
-        """Ask the accept loop to stop and tear down all client connections."""
-        stop = getattr(self, "_stop", None)
-        if stop is not None:
-            stop.set()
-
-    def _all_clients(self) -> list["_Client"]:
-        with self._lock:
-            return list(self._clients.values())
+        """Ask the running loop to stop (call via loop.call_soon_threadsafe)."""
+        self._stop = True
+        if self._main_server is not None:
+            self._main_server.close()
 
     # -- first-frame dispatch (the auth middleware) ------------------------
-    def _handle(self, conn: socket.socket, addr) -> None:
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
         try:
-            frame_type, payload = _recv_frame(conn, self.key)
+            frame_type, payload = await asyncio.wait_for(
+                aio.read_typed(reader, self.key), timeout=15
+            )
             if frame_type != protocol.FRAME_TYPE_CTRL:
                 raise protocol.ProtocolError(f"first frame not CTRL ({frame_type})")
             first = protocol.decode_control(payload)
         except Exception as exc:  # noqa: BLE001 - drop anything that fails
-            log.warning("reject %s: %s", addr, exc)
-            _safe_close(conn)
+            log.warning("reject %s: %s", peer, exc)
+            _close_writer(writer)
             return
 
         mtype = first.get("type")
         if mtype == msg.LOGIN_REQ:
-            self._handle_login(conn, first)
+            await self._handle_login(reader, writer, first)
         elif mtype == msg.CONNECT_RES:
-            self._handle_connect_res(conn, first)
+            await self._handle_connect_res(reader, writer, first)
         else:
-            log.warning("reject %s: unknown first message %r", addr, mtype)
-            _safe_close(conn)
+            log.warning("reject %s: unknown first message %r", peer, mtype)
+            _close_writer(writer)
 
-    def _handle_login(self, conn: socket.socket, d: dict) -> None:
+    async def _handle_login(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, d: dict
+    ) -> None:
         try:
             req = msg.LoginReq.from_dict(d)
         except (KeyError, TypeError, ValueError) as exc:
-            self._send_safe(conn, msg.LoginRes(code=msg.CODE_BAD_REQUEST).to_dict())
+            await self._send_safe(writer, msg.LoginRes(code=msg.CODE_BAD_REQUEST).to_dict())
             log.warning("bad login request: %s", exc)
-            _safe_close(conn)
+            _close_writer(writer)
             return
 
-        with self._lock:
-            if not req.name:
-                req.name = self._new_name_locked()
-            if req.name in self._clients:
-                self._send_safe(conn, msg.LoginRes(code=msg.CODE_NAME_EXIST).to_dict())
-                log.warning("client name exists: %s", req.name)
-                _safe_close(conn)
-                return
+        if not req.name:
+            req.name = self._new_name()
+        if req.name in self.clients:
+            await self._send_safe(writer, msg.LoginRes(code=msg.CODE_NAME_EXIST).to_dict())
+            log.warning("client name exists: %s", req.name)
+            _close_writer(writer)
+            return
 
-            client = _Client(req.name, conn, self.key)
-            created: list[_Service] = []
-            try:
-                for proxy in req.proxies:
-                    svc = self._open_service(req.name, proxy)
-                    client.add_service(svc)
-                    created.append(svc)
-            except OSError as exc:
-                for svc in created:
-                    svc.close_all()
-                self._send_safe(conn, msg.LoginRes(code=msg.CODE_REMOTE_PORT_ERROR).to_dict())
-                log.error(
-                    "cannot expose proxy for client %s: port %s:%d may be in use (%s); "
-                    "rejecting login",
-                    req.name, proxy.remote_ip, proxy.remote_port, exc,
-                )
-                _safe_close(conn)
-                return
+        client = _Client(req.name, writer, self.key)
+        created: list[_Service] = []
+        try:
+            for proxy in req.proxies:
+                svc = await self._open_service(client, proxy)
+                client.services[proxy.name] = svc
+                created.append(svc)
+        except OSError as exc:
+            for svc in created:
+                svc.close()
+            await self._send_safe(writer, msg.LoginRes(code=msg.CODE_REMOTE_PORT_ERROR).to_dict())
+            log.error(
+                "cannot expose proxy for client %s: port %s:%d may be in use (%s); "
+                "rejecting login",
+                req.name, proxy.remote_ip, proxy.remote_port, exc,
+            )
+            _close_writer(writer)
+            return
 
-            self._clients[req.name] = client
-
-        self._send_safe(conn, msg.LoginRes(code=msg.CODE_OK, name=req.name).to_dict())
+        self.clients[req.name] = client
+        await self._send_safe(writer, msg.LoginRes(code=msg.CODE_OK, name=req.name).to_dict())
         log.info("client logged in: name=%s proxies=%d", req.name, len(req.proxies))
 
-        for svc in client.all_services():
-            threading.Thread(target=self._accept_service, args=(client, svc), daemon=True).start()
-
-        self._read_control(conn, req.name)
-
-    def _open_service(self, client_name: str, proxy) -> _Service:
-        s = _make_listener(proxy.remote_ip, proxy.remote_port)
-        log.info("service %s/%s listening on %s:%d",
-                 client_name, proxy.name, proxy.remote_ip, proxy.remote_port)
-        return _Service(proxy.name, s, self.key)
-
-    def _read_control(self, conn: socket.socket, client_name: str) -> None:
         try:
-            while True:
-                frame_type, payload = _recv_frame(conn, self.key)
+            while not self._stop:
+                frame_type, payload = await aio.read_typed(reader, self.key)
                 if frame_type != protocol.FRAME_TYPE_CTRL:
                     raise protocol.ProtocolError("non-CTRL frame on control connection")
-                d = protocol.decode_control(payload)
-                log.debug("control %s: %s", client_name, d.get("type"))
+                ctrl = protocol.decode_control(payload)
+                log.debug("control %s: %s", req.name, ctrl.get("type"))
         except Exception as exc:  # noqa: BLE001
-            log.info("control closed for %s: %s", client_name, exc)
+            log.info("control closed for %s: %s", req.name, exc)
         finally:
-            self._remove_client(client_name, conn)
+            self._remove_client(req.name, writer)
 
-    def _remove_client(self, client_name: str, conn: socket.socket) -> None:
-        with self._lock:
-            client = self._clients.get(client_name)
-            if client is None or client.control is not conn:
-                return
-            del self._clients[client_name]
-        client.close_all()
+    async def _open_service(self, client: _Client, proxy) -> _Service:
+        sock = make_listen_socket(proxy.remote_ip, proxy.remote_port)
+
+        service = _Service(proxy.name, None)
+
+        async def on_conn(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await self._handle_external(client, service, r, w)
+
+        server = await asyncio.start_server(on_conn, sock=sock)
+        service.server = server
+        log.info("service %s/%s listening on %s:%d",
+                 client.name, proxy.name, proxy.remote_ip, proxy.remote_port)
+        return service
+
+    def _remove_client(self, client_name: str, writer: asyncio.StreamWriter) -> None:
+        client = self.clients.get(client_name)
+        if client is None or client.control is not writer:
+            return
+        del self.clients[client_name]
+        client.close()
         log.info("client removed: %s", client_name)
 
-    def _accept_service(self, client: _Client, service: _Service) -> None:
-        while True:
-            try:
-                external, addr = service.sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._handle_external,
-                             args=(client, service, external, addr), daemon=True).start()
-
-    def _handle_external(self, client: _Client, service: _Service, external, addr) -> None:
+    async def _handle_external(
+        self,
+        client: _Client,
+        service: _Service,
+        external_reader: asyncio.StreamReader,
+        external_writer: asyncio.StreamWriter,
+    ) -> None:
+        peer = external_writer.get_extra_info("peername")
         task_id = service.next_task_id()
-        service.add_session(task_id, external)
-        log.info("external %s -> %s/%s task=%d", addr, client.name, service.name, task_id)
+        service.add_session(task_id, external_reader, external_writer)
+        log.info("external %s -> %s/%s task=%d", peer, client.name, service.name, task_id)
         try:
-            client.send(msg.ConnectReq(service_name=service.name, task_id=task_id).to_dict())
+            await client.send(
+                msg.ConnectReq(service_name=service.name, task_id=task_id).to_dict()
+            )
         except (OSError, crypto.CryptoError) as exc:
             log.error("send connectReq failed: %s", exc)
             service.pop_session(task_id)
-            _safe_close(external)
+            _close_writer(external_writer)
 
-    def _handle_connect_res(self, conn: socket.socket, d: dict) -> None:
+    async def _handle_connect_res(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, d: dict
+    ) -> None:
         try:
             res = msg.ConnectRes.from_dict(d)
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("bad connectRes: %s", exc)
-            _safe_close(conn)
+            _close_writer(writer)
             return
 
         if res.code != msg.CODE_OK:
             log.warning("client rejected task %d (code=%d)", res.task_id, res.code)
-            _safe_close(conn)
+            _close_writer(writer)
             return
 
-        with self._lock:
-            client = self._clients.get(res.client_name)
+        client = self.clients.get(res.client_name)
         if client is None:
             log.warning("connectRes for unknown client: %s", res.client_name)
-            _safe_close(conn)
+            _close_writer(writer)
             return
-        service = client.get_service(res.service_name)
+        service = client.services.get(res.service_name)
         if service is None:
             log.warning("connectRes for unknown service: %s", res.service_name)
-            _safe_close(conn)
+            _close_writer(writer)
             return
-        external = service.pop_session(res.task_id)
-        if external is None:
+        session = service.pop_session(res.task_id)
+        if session is None:
             log.warning("connectRes for unknown task: %d", res.task_id)
-            _safe_close(conn)
+            _close_writer(writer)
             return
 
+        external_reader, external_writer = session
         log.debug("task %d paired, relaying", res.task_id)
-        _relay_encrypted(external, conn, self.key)
+        # The external side is a plaintext socket (raw bytes); the client data
+        # connection carries encrypted DATA frames.
+        try:
+            await aio.relay_plain_to_encrypted(
+                external_reader, external_writer, reader, writer, self.key
+            )
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
 
-    def _new_name_locked(self) -> str:
+    def _new_name(self) -> str:
         i = 1
-        while f"client{i:02d}" in self._clients:
+        while f"client{i:02d}" in self.clients:
             i += 1
         return f"client{i:02d}"
 
-    def _send_safe(self, conn: socket.socket, obj: dict) -> None:
+    async def _send_safe(self, writer: asyncio.StreamWriter, obj: dict) -> None:
         try:
-            crypto.write_frame(conn.makefile("wb", buffering=0), self.key,
-                               protocol.encode_control(obj))
+            await aio.send_control(writer, self.key, obj)
         except (OSError, crypto.CryptoError):
             pass
