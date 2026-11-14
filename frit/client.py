@@ -128,7 +128,13 @@ class Client:
             res = self._recv_control_until(control)
             code = int(res.get("code", -1))
             if code != msg.CODE_OK:
-                raise OSError(f"login rejected, code={code}")
+                reason = {
+                    msg.CODE_TOKEN_ERROR: "authentication failed (bad psk)",
+                    msg.CODE_NAME_EXIST: "client name already exists",
+                    msg.CODE_REMOTE_PORT_ERROR: "a remote proxy port is in use on the server",
+                    msg.CODE_BAD_REQUEST: "bad request",
+                }.get(code, "unknown error")
+                raise OSError(f"login rejected, code={code} ({reason})")
             name = res.get("name") or self.cfg.name
             log.info("login success, name=%s", name)
 

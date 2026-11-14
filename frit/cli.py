@@ -18,7 +18,7 @@ import sys
 from . import __version__
 from .client import Client
 from .config import ClientConfig, ConfigError, ServerConfig
-from .server import Server
+from .server import BindError, Server
 
 log = logging.getLogger("frit.cli")
 
@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
             client.run()
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except BindError as exc:
+        print(f"startup failed: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("bye", file=sys.stderr)

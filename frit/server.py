@@ -29,6 +29,16 @@ from .config import ServerConfig
 log = logging.getLogger("frit.server")
 
 
+class BindError(Exception):
+    """Raised when the main listen address cannot be bound."""
+
+    def __init__(self, host: str, port: int, cause: OSError):
+        self.host = host
+        self.port = port
+        self.cause = cause
+        super().__init__(f"cannot bind tcp://{host}:{port}: {cause}")
+
+
 # --------------------------------------------------------------------------
 # frame helpers
 # --------------------------------------------------------------------------
@@ -166,7 +176,15 @@ class Server:
     def run(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.cfg.host, self.cfg.port))
+        try:
+            srv.bind((self.cfg.host, self.cfg.port))
+        except OSError as exc:
+            log.error(
+                "cannot bind tcp://%s:%d (%s). The port may already be in use.",
+                self.cfg.host, self.cfg.port, exc,
+            )
+            srv.close()
+            raise BindError(self.cfg.host, self.cfg.port, exc) from exc
         srv.listen(128)
         # A short accept timeout lets the loop observe self._stop promptly, so a
         # signal handler (see cli.py) can shut the server down cleanly even while
@@ -256,7 +274,11 @@ class Server:
                 for svc in created:
                     svc.close_all()
                 self._send_safe(conn, msg.LoginRes(code=msg.CODE_REMOTE_PORT_ERROR).to_dict())
-                log.error("listen proxy failed for %s: %s", req.name, exc)
+                log.error(
+                    "cannot expose proxy for client %s: port %s:%d may be in use (%s); "
+                    "rejecting login",
+                    req.name, proxy.remote_ip, proxy.remote_port, exc,
+                )
                 _safe_close(conn)
                 return
 
