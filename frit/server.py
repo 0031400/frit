@@ -101,7 +101,9 @@ class _Pending:
         self.reader = reader
         self.writer = writer
         # Resolved with the paired (reader, writer) of the client data conn.
-        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.future: asyncio.Future[
+            tuple[asyncio.StreamReader, asyncio.StreamWriter] | None
+        ] = asyncio.get_running_loop().create_future()
 
 
 # --------------------------------------------------------------------------
@@ -262,19 +264,25 @@ class Server:
 
         client = _Client(req.name, writer, self.key)
         created: list[_Service] = []
-        try:
-            for proxy in req.proxies:
+        failure: tuple[str, int, OSError] | None = None
+        for proxy in req.proxies:
+            try:
                 svc = await self._open_service(client, proxy)
-                client.services[proxy.name] = svc
-                created.append(svc)
-        except OSError as exc:
+            except OSError as exc:
+                failure = (proxy.remote_ip, proxy.remote_port, exc)
+                break
+            client.services[proxy.name] = svc
+            created.append(svc)
+
+        if failure is not None:
+            bad_ip, bad_port, failed_exc = failure
             for svc in created:
                 svc.close()
             await self._send_safe(writer, msg.LoginRes(code=msg.CODE_REMOTE_PORT_ERROR).to_dict())
             log.error(
                 "cannot expose proxy for client %s: port %s:%d may be in use (%s); "
                 "rejecting login",
-                req.name, proxy.remote_ip, proxy.remote_port, exc,
+                req.name, bad_ip, bad_port, failed_exc,
             )
             _close_writer(writer)
             return
