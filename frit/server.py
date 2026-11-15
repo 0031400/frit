@@ -81,6 +81,29 @@ def _close_writer(writer: asyncio.StreamWriter | None) -> None:
         pass
 
 
+# task ids are allocated per service and wrapped around at this cap so the
+# counter never grows without bound on a long-running server.  Any id still
+# in-flight is skipped during allocation.
+_TASK_ID_MAX = 0x7FFFFFFF
+
+# How long the server waits for the client to answer a connectReq with a
+# connectRes before giving up on that external connection.  Prevents leaked
+# sessions if the client is slow / stuck / the notification is lost.
+PENDING_CONNECT_TIMEOUT = 30.0
+
+
+class _Pending:
+    """A not-yet-paired external connection awaiting the client's data conn."""
+
+    __slots__ = ("reader", "writer", "future")
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        # Resolved with the paired (reader, writer) of the client data conn.
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+
+
 # --------------------------------------------------------------------------
 # model
 # --------------------------------------------------------------------------
@@ -89,11 +112,16 @@ class _Service:
         self.name = name
         self.server = server
         self._task_id = 0
-        # task_id -> (external reader, external writer)  [plaintext peer]
-        self._sessions: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+        # task_id -> _Pending (external peer waiting for the client data conn)
+        self._sessions: dict[int, _Pending] = {}
 
     def next_task_id(self) -> int:
-        self._task_id += 1
+        # Wrap around and skip ids that are still in flight.
+        for _ in range(len(self._sessions) + 1):
+            self._task_id = self._task_id % _TASK_ID_MAX + 1
+            if self._task_id not in self._sessions:
+                return self._task_id
+        # Extremely unlikely (all ids busy); still return a unique-ish id.
         return self._task_id
 
     def add_session(
@@ -101,19 +129,21 @@ class _Service:
         task_id: int,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-    ) -> None:
-        self._sessions[task_id] = (reader, writer)
+    ) -> _Pending:
+        pending = _Pending(reader, writer)
+        self._sessions[task_id] = pending
+        return pending
 
-    def pop_session(
-        self, task_id: int
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+    def pop_session(self, task_id: int) -> _Pending | None:
         return self._sessions.pop(task_id, None)
 
     def close(self) -> None:
         if self.server is not None:
             self.server.close()
-        for _reader, writer in self._sessions.values():
-            _close_writer(writer)
+        for pending in self._sessions.values():
+            _close_writer(pending.writer)
+            if not pending.future.done():
+                pending.future.set_result(None)
         self._sessions.clear()
 
 
@@ -220,6 +250,16 @@ class Server:
             _close_writer(writer)
             return
 
+        # Reject duplicate proxy names inside a single login (Go checks this).
+        seen: set[str] = set()
+        for proxy in req.proxies:
+            if not proxy.name or proxy.name in seen:
+                await self._send_safe(writer, msg.LoginRes(code=msg.CODE_BAD_REQUEST).to_dict())
+                log.warning("duplicate/empty proxy name in login for %s", req.name)
+                _close_writer(writer)
+                return
+            seen.add(proxy.name)
+
         client = _Client(req.name, writer, self.key)
         created: list[_Service] = []
         try:
@@ -286,7 +326,7 @@ class Server:
     ) -> None:
         peer = external_writer.get_extra_info("peername")
         task_id = service.next_task_id()
-        service.add_session(task_id, external_reader, external_writer)
+        pending = service.add_session(task_id, external_reader, external_writer)
         log.info("external %s -> %s/%s task=%d", peer, client.name, service.name, task_id)
         try:
             await client.send(
@@ -296,6 +336,27 @@ class Server:
             log.error("send connectReq failed: %s", exc)
             service.pop_session(task_id)
             _close_writer(external_writer)
+            if not pending.future.done():
+                pending.future.cancel()
+            return
+
+        # Wait for the client to open its data connection and report back.
+        # If it never arrives, drop the external connection so it does not leak.
+        try:
+            await asyncio.wait_for(asyncio.shield(pending.future), PENDING_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning(
+                "task %d (%s/%s) not paired within %.0fs, dropping external %s",
+                task_id, client.name, service.name, PENDING_CONNECT_TIMEOUT, peer,
+            )
+            service.pop_session(task_id)
+            _close_writer(external_writer)
+            if not pending.future.done():
+                pending.future.cancel()
+        except asyncio.CancelledError:
+            service.pop_session(task_id)
+            _close_writer(external_writer)
+            raise
 
     async def _handle_connect_res(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, d: dict
@@ -309,6 +370,17 @@ class Server:
 
         if res.code != msg.CODE_OK:
             log.warning("client rejected task %d (code=%d)", res.task_id, res.code)
+            # Drop the pending external connection immediately instead of
+            # letting it sit until the pairing timeout.
+            client = self.clients.get(res.client_name)
+            if client is not None:
+                service = client.services.get(res.service_name)
+                if service is not None:
+                    pending = service.pop_session(res.task_id)
+                    if pending is not None:
+                        _close_writer(pending.writer)
+                        if not pending.future.done():
+                            pending.future.cancel()
             _close_writer(writer)
             return
 
@@ -322,19 +394,21 @@ class Server:
             log.warning("connectRes for unknown service: %s", res.service_name)
             _close_writer(writer)
             return
-        session = service.pop_session(res.task_id)
-        if session is None:
+        pending = service.pop_session(res.task_id)
+        if pending is None:
             log.warning("connectRes for unknown task: %d", res.task_id)
             _close_writer(writer)
             return
 
-        external_reader, external_writer = session
+        # Tell the waiting external handler that pairing succeeded, then relay.
+        if not pending.future.done():
+            pending.future.set_result((reader, writer))
         log.debug("task %d paired, relaying", res.task_id)
         # The external side is a plaintext socket (raw bytes); the client data
         # connection carries encrypted DATA frames.
         try:
             await aio.relay_plain_to_encrypted(
-                external_reader, external_writer, reader, writer, self.key
+                pending.reader, pending.writer, reader, writer, self.key
             )
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass

@@ -146,21 +146,34 @@ class Client:
             log.error("connect data channel: %s", exc)
             return
 
-        try:
-            res = msg.ConnectRes(code=msg.CODE_OK, task_id=task_id,
-                                 service_name=service_name, client_name=client_name)
-            await aio.send_control(data_writer, self.key, res.to_dict())
-        except (OSError, crypto.CryptoError) as exc:
-            log.error("send connectRes: %s", exc)
-            _close_writer(data_writer)
-            return
-
+        # Dial the local service first.  If it fails, tell the server with a
+        # non-zero code so it drops the pending external connection immediately
+        # (instead of waiting for its 30s pairing timeout).
         try:
             local_reader, local_writer = await self._open_connection(
                 proxy.local_ip, proxy.local_port
             )
         except OSError as exc:
             log.error("connect local %s:%d: %s", proxy.local_ip, proxy.local_port, exc)
+            try:
+                await aio.send_control(
+                    data_writer, self.key,
+                    msg.ConnectRes(code=msg.CODE_BAD_REQUEST, task_id=task_id,
+                                   service_name=service_name,
+                                   client_name=client_name).to_dict(),
+                )
+            except (OSError, crypto.CryptoError):
+                pass
+            _close_writer(data_writer)
+            return
+
+        try:
+            res = msg.ConnectRes(code=msg.CODE_OK, task_id=task_id,
+                                 service_name=service_name, client_name=client_name)
+            await aio.send_control(data_writer, self.key, res.to_dict())
+        except (OSError, crypto.CryptoError) as exc:
+            log.error("send connectRes: %s", exc)
+            _close_writer(local_writer)
             _close_writer(data_writer)
             return
 
