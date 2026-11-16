@@ -10,6 +10,9 @@ LOGIN_REQ = "loginReq"
 LOGIN_RES = "loginRes"
 CONNECT_REQ = "connectReq"
 CONNECT_RES = "connectRes"
+# Control-connection liveness probe: ping carries an id, pong echoes it.
+PING = "ping"
+PONG = "pong"
 
 
 # login response codes

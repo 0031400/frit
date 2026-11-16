@@ -26,7 +26,15 @@ from .config import ClientConfig
 
 log = logging.getLogger("frit.client")
 
-RECONNECT_DELAY = 5.0
+RECONNECT_DELAY = 2.0
+# The server pings every 60s; if nothing at all arrives for this long the
+# control connection is considered dead and we reconnect.
+CONTROL_READ_TIMEOUT = 150.0
+SERVER_CONNECT_TIMEOUT = 10.0
+# Must stay well below the server's 5s pairing timeout so a live client can
+# still report success/failure before the external connection is dropped.
+DATA_CONNECT_TIMEOUT = 3.0
+LOCAL_CONNECT_TIMEOUT = 2.0
 
 
 def _close_writer(writer: asyncio.StreamWriter | None) -> None:
@@ -77,20 +85,25 @@ class Client:
         log.info("client stopped")
 
     async def _open_connection(
-        self, host: str, port: int
+        self, host: str, port: int, timeout: float
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         return await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10
+            asyncio.open_connection(host, port), timeout=timeout
         )
+
+    async def _send_control(self, writer: asyncio.StreamWriter, obj: dict) -> None:
+        # Each stream has a single writer (control: this loop; data: its own
+        # handshake task), so no lock is needed here.
+        await aio.send_control(writer, self.key, obj)
 
     async def _run_session(self) -> None:
         reader, writer = await self._open_connection(
-            self.cfg.server_host, self.cfg.server_port
+            self.cfg.server_host, self.cfg.server_port, SERVER_CONNECT_TIMEOUT
         )
         self._control_writer = writer
         try:
             login = msg.LoginReq(name=self.cfg.name, proxies=self.cfg.proxies)
-            await aio.send_control(writer, self.key, login.to_dict())
+            await self._send_control(writer, login.to_dict())
 
             frame_type, payload = await asyncio.wait_for(
                 aio.read_typed(reader, self.key), timeout=15
@@ -111,11 +124,20 @@ class Client:
             log.info("login success, name=%s", name)
 
             while not self._stop:
-                frame_type, payload = await aio.read_typed(reader, self.key)
+                try:
+                    frame_type, payload = await asyncio.wait_for(
+                        aio.read_typed(reader, self.key),
+                        timeout=CONTROL_READ_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    raise OSError(
+                        f"no control message for {CONTROL_READ_TIMEOUT:.0f}s; reconnecting"
+                    ) from None
                 if frame_type != protocol.FRAME_TYPE_CTRL:
                     raise protocol.ProtocolError("non-CTRL frame on control connection")
                 d = protocol.decode_control(payload)
-                if d.get("type") == msg.CONNECT_REQ:
+                mtype = d.get("type")
+                if mtype == msg.CONNECT_REQ:
                     task = asyncio.create_task(
                         self._handle_connect_req(
                             name, d.get("service_name", ""), int(d.get("taskId", 0))
@@ -123,8 +145,12 @@ class Client:
                     )
                     self._data_tasks.add(task)
                     task.add_done_callback(self._data_tasks.discard)
+                elif mtype == msg.PING:
+                    await self._send_control(
+                        writer, {"type": msg.PONG, "id": d.get("id")}
+                    )
                 else:
-                    log.debug("unknown control message: %s", d.get("type"))
+                    log.debug("unknown control message: %s", mtype)
         finally:
             _close_writer(writer)
             if self._control_writer is writer:
@@ -140,9 +166,9 @@ class Client:
 
         try:
             data_reader, data_writer = await self._open_connection(
-                self.cfg.server_host, self.cfg.server_port
+                self.cfg.server_host, self.cfg.server_port, DATA_CONNECT_TIMEOUT
             )
-        except OSError as exc:
+        except (OSError, asyncio.TimeoutError) as exc:
             log.error("connect data channel: %s", exc)
             return
 
@@ -151,13 +177,13 @@ class Client:
         # (instead of waiting for its 30s pairing timeout).
         try:
             local_reader, local_writer = await self._open_connection(
-                proxy.local_ip, proxy.local_port
+                proxy.local_ip, proxy.local_port, LOCAL_CONNECT_TIMEOUT
             )
-        except OSError as exc:
+        except (OSError, asyncio.TimeoutError) as exc:
             log.error("connect local %s:%d: %s", proxy.local_ip, proxy.local_port, exc)
             try:
-                await aio.send_control(
-                    data_writer, self.key,
+                await self._send_control(
+                    data_writer,
                     msg.ConnectRes(code=msg.CODE_BAD_REQUEST, task_id=task_id,
                                    service_name=service_name,
                                    client_name=client_name).to_dict(),
@@ -170,7 +196,7 @@ class Client:
         try:
             res = msg.ConnectRes(code=msg.CODE_OK, task_id=task_id,
                                  service_name=service_name, client_name=client_name)
-            await aio.send_control(data_writer, self.key, res.to_dict())
+            await self._send_control(data_writer, res.to_dict())
         except (OSError, crypto.CryptoError) as exc:
             log.error("send connectRes: %s", exc)
             _close_writer(local_writer)

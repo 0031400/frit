@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import socket
 import sys
 
@@ -89,7 +90,16 @@ _TASK_ID_MAX = 0x7FFFFFFF
 # How long the server waits for the client to answer a connectReq with a
 # connectRes before giving up on that external connection.  Prevents leaked
 # sessions if the client is slow / stuck / the notification is lost.
-PENDING_CONNECT_TIMEOUT = 30.0
+PENDING_CONNECT_TIMEOUT = 5.0
+
+# Control-connection liveness.  Every client is pinged once per interval
+# (with jitter so clients do not fire together); a pong must come back within
+# PONG_TIMEOUT.  One missed pong removes the client, which also frees its name
+# and closes its proxy listeners, so external connections fail fast instead of
+# hanging on a client that is gone (frozen process, sleep, NAT timeout, ...).
+PING_INTERVAL = 60.0
+PING_JITTER = 0.1
+PONG_TIMEOUT = 5.0
 
 
 class _Pending:
@@ -156,15 +166,76 @@ class _Client:
         self.key = key
         self.services: dict[str, _Service] = {}
         self._write_lock = asyncio.Lock()
+        # --- liveness ---
+        self._ping_id = 0
+        self._pong_waiters: dict[int, asyncio.Future[bool]] = {}
+        self._probe_lock = asyncio.Lock()
+        self.watchdog: asyncio.Task | None = None
+        # Number of in-flight pairing-timeout probes; while > 0 new external
+        # connections are rejected instead of waiting again.
+        self._probe_depth = 0
+        self.closed = False
+
+    @property
+    def suspect(self) -> bool:
+        return self._probe_depth > 0
+
+    def begin_probe(self) -> None:
+        self._probe_depth += 1
+
+    def end_probe(self) -> None:
+        self._probe_depth = max(0, self._probe_depth - 1)
 
     async def send(self, obj: dict) -> None:
         async with self._write_lock:
             await aio.send_control(self.control, self.key, obj)
 
+    async def probe(self, timeout: float) -> bool:
+        """Ping over the control connection; True if the pong comes back."""
+        if self.closed:
+            return False
+        async with self._probe_lock:
+            if self.closed:
+                return False
+            self._ping_id += 1
+            ping_id = self._ping_id
+            waiter: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._pong_waiters[ping_id] = waiter
+            try:
+                try:
+                    await asyncio.wait_for(
+                        self.send({"type": msg.PING, "id": ping_id}), timeout
+                    )
+                except (asyncio.TimeoutError, OSError, crypto.CryptoError):
+                    return False
+                try:
+                    return bool(await asyncio.wait_for(waiter, timeout))
+                except asyncio.TimeoutError:
+                    return False
+            finally:
+                self._pong_waiters.pop(ping_id, None)
+
+    def on_pong(self, ping_id: object) -> None:
+        try:
+            key = int(ping_id)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        waiter = self._pong_waiters.get(key)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(True)
+
     def close(self) -> None:
+        self.closed = True
         for svc in self.services.values():
             svc.close()
         _close_writer(self.control)
+        for waiter in self._pong_waiters.values():
+            if not waiter.done():
+                waiter.set_result(False)
+        self._pong_waiters.clear()
+        task = self.watchdog
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +361,7 @@ class Server:
         self.clients[req.name] = client
         await self._send_safe(writer, msg.LoginRes(code=msg.CODE_OK, name=req.name).to_dict())
         log.info("client logged in: name=%s proxies=%d", req.name, len(req.proxies))
+        client.watchdog = asyncio.create_task(self._watchdog(client))
 
         try:
             while not self._stop:
@@ -297,7 +369,11 @@ class Server:
                 if frame_type != protocol.FRAME_TYPE_CTRL:
                     raise protocol.ProtocolError("non-CTRL frame on control connection")
                 ctrl = protocol.decode_control(payload)
-                log.debug("control %s: %s", req.name, ctrl.get("type"))
+                mtype = ctrl.get("type")
+                if mtype == msg.PONG:
+                    client.on_pong(ctrl.get("id"))
+                else:
+                    log.debug("control %s: %s", req.name, mtype)
         except Exception as exc:  # noqa: BLE001
             log.info("control closed for %s: %s", req.name, exc)
         finally:
@@ -333,6 +409,10 @@ class Server:
         external_writer: asyncio.StreamWriter,
     ) -> None:
         peer = external_writer.get_extra_info("peername")
+        if client.suspect:
+            log.warning("client %s is being probed, rejecting external %s", client.name, peer)
+            _close_writer(external_writer)
+            return
         task_id = service.next_task_id()
         pending = service.add_session(task_id, external_reader, external_writer)
         log.info("external %s -> %s/%s task=%d", peer, client.name, service.name, task_id)
@@ -361,10 +441,59 @@ class Server:
             _close_writer(external_writer)
             if not pending.future.done():
                 pending.future.cancel()
+            await self._probe_or_remove(client)
         except asyncio.CancelledError:
             service.pop_session(task_id)
             _close_writer(external_writer)
             raise
+
+    async def _probe_or_remove(self, client: _Client) -> None:
+        """Tell a slow client from a dead one after a failed pairing.
+
+        The external connection is already gone; here we only decide whether
+        the client itself is still alive.  While the probe runs, `suspect` is
+        set so further external connections are rejected immediately.
+        """
+        client.begin_probe()
+        try:
+            alive = await client.probe(PONG_TIMEOUT)
+        finally:
+            client.end_probe()
+        if self.clients.get(client.name) is not client:
+            return  # another path already removed this client
+        if alive:
+            log.info("client %s answered ping after a pairing timeout", client.name)
+            return
+        log.warning(
+            "client %s did not answer ping within %.0fs after a pairing timeout; "
+            "removing it (its proxy listeners are closed)",
+            client.name, PONG_TIMEOUT,
+        )
+        self._remove_client(client.name, client.control)
+
+    async def _watchdog(self, client: _Client) -> None:
+        """Ping the client periodically and drop it when it stops answering."""
+        try:
+            while True:
+                delay = PING_INTERVAL * random.uniform(1 - PING_JITTER, 1 + PING_JITTER)
+                await asyncio.sleep(delay)
+                if self.clients.get(client.name) is not client:
+                    return
+                if await client.probe(PONG_TIMEOUT):
+                    continue
+                if self.clients.get(client.name) is not client:
+                    return
+                log.warning(
+                    "client %s did not answer ping within %.0fs; removing it "
+                    "(its proxy listeners are closed)",
+                    client.name, PONG_TIMEOUT,
+                )
+                self._remove_client(client.name, client.control)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watchdog error for client %s", client.name)
 
     async def _handle_connect_res(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, d: dict
